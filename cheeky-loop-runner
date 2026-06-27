@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+#
+# cheeky-loop-runner — run a shell script in a tmux session on a timed loop.
+# -------------------------------------------------------------------
+# Usage:
+#   cheeky-loop-runner <script.sh> [run_minutes]
+#
+# Install: drop this file on your PATH (e.g. ~/.local/bin/cheeky-loop-runner)
+# and make it executable. Then, from any sandbox directory:
+#   cheeky-loop-runner do_work.sh
+#
+# It runs <script.sh> inside a detached tmux session (rooted in the
+# directory you invoked it from), lets it run for run_minutes (default
+# 30), sends 4x Ctrl-C to kill it, then restarts. Loops forever until
+# you Ctrl-C this process or create the stopfile.
+# -------------------------------------------------------------------
+
+set -uo pipefail   # no -e: a transient tmux hiccup shouldn't abort the loop
+
+# ---- Args ----------------------------------------------------------
+if [[ $# -lt 1 || "$1" == "-h" || "$1" == "--help" ]]; then
+    echo "Usage: cheeky-loop-runner <script.sh> [run_minutes]"
+    exit 1
+fi
+
+TARGET="$1"
+RUN_MINUTES="${2:-30}"
+
+if [[ ! -f "$TARGET" ]]; then
+    echo "Error: '$TARGET' is not a file." >&2
+    exit 1
+fi
+if [[ ! -r "$TARGET" ]]; then
+    echo "Error: '$TARGET' is not readable." >&2
+    exit 1
+fi
+
+# Resolve to an absolute path so it still works once the session cwd is set.
+SCRIPT_ABS="$(cd "$(dirname "$TARGET")" && pwd)/$(basename "$TARGET")"
+
+# ---- Configuration -------------------------------------------------
+SANDBOX="$PWD"                                  # run in the dir you invoked from
+BASE="$(basename "$TARGET")"
+SAFE="${BASE//[^A-Za-z0-9_]/_}"                 # tmux-safe version of the name
+SESSION="looprunner-${SAFE}"                    # tmux session name
+STOPFILE="${SANDBOX}/${BASE}.stop"              # create this file to stop the loop
+RUN_SECONDS=$(( RUN_MINUTES * 60 ))
+SETTLE_SECONDS=2                                # pause after Ctrl-C so it exits
+POLL_SECONDS=10                                 # stopfile check interval
+CMD="bash $(printf '%q' "$SCRIPT_ABS")"         # the command run inside tmux
+# --------------------------------------------------------------------
+
+command -v tmux >/dev/null 2>&1 || { echo "Error: tmux is not installed." >&2; exit 1; }
+
+# Start fresh: drop any leftover session with this name, then create a new
+# one rooted in the sandbox directory.
+tmux kill-session -t "$SESSION" 2>/dev/null
+tmux new-session -d -s "$SESSION" -c "$SANDBOX"
+
+send_ctrl_c() {
+    for _ in 1 2 3 4; do
+        tmux send-keys -t "$SESSION" C-c 2>/dev/null
+        sleep 0.3
+    done
+}
+
+cleanup() {
+    echo "Stopping: sending Ctrl-C and tearing down session '$SESSION'..."
+    send_ctrl_c
+    tmux kill-session -t "$SESSION" 2>/dev/null
+    exit 0
+}
+
+# Ctrl-C / kill on THIS process cleans up the tmux session too.
+trap cleanup INT TERM
+
+echo "cheeky-loop-runner started."
+echo "  script : $SCRIPT_ABS"
+echo "  cwd    : $SANDBOX"
+echo "  session: $SESSION   (attach: tmux attach -t $SESSION)"
+echo "  period : ${RUN_MINUTES} min"
+echo "  stop   : touch '$STOPFILE'   (or Ctrl-C here)"
+
+cycle=1
+while true; do
+    if [[ -e "$STOPFILE" ]]; then
+        echo "Stopfile found at $STOPFILE — exiting."
+        cleanup
+    fi
+
+    echo "[$(date '+%F %T')] Cycle $cycle: starting -> $CMD"
+    tmux send-keys -t "$SESSION" "$CMD" Enter
+
+    # Wait the run period, checking the stopfile periodically.
+    waited=0
+    while (( waited < RUN_SECONDS )); do
+        if [[ -e "$STOPFILE" ]]; then
+            echo "Stopfile found mid-run — exiting."
+            cleanup
+        fi
+        sleep "$POLL_SECONDS"
+        waited=$(( waited + POLL_SECONDS ))
+    done
+
+    echo "[$(date '+%F %T')] Cycle $cycle: sending 4x Ctrl-C."
+    send_ctrl_c
+    sleep "$SETTLE_SECONDS"
+    cycle=$(( cycle + 1 ))
+done
+
