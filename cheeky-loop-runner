@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# cheeky-loop-runner — run a shell script in a tmux session on a timed loop.
+# cheeky-loop-runner — run a shell script in a tmux session on a timed
+# AND event-driven loop.
 # -------------------------------------------------------------------
 # Usage:
 #   cheeky-loop-runner <script.sh> [run_minutes]
@@ -10,16 +11,47 @@
 #   cheeky-loop-runner do_work.sh
 #
 # It runs <script.sh> inside a detached tmux session (rooted in the
-# directory you invoked it from), lets it run for run_minutes (default
-# 30), sends 4x Ctrl-C to kill it, then restarts. Loops forever until
-# you Ctrl-C this process or create the stopfile.
+# directory you invoked it from). Each cycle ends as soon as ANY of:
+#   * the trigger file is touched/modified by your script (event-driven),
+#   * the run period elapses (run_minutes, default 30; 0 = no time limit),
+#   * the stopfile appears (clean shutdown).
+# On trigger/timer it sends 4x Ctrl-C to kill the program, waits a short
+# configurable grace period, then restarts. Loops forever until you Ctrl-C
+# this process or create the stopfile.
+#
+# EVENT-DRIVEN RESTARTS
+#   Your loop body (the "inner" script) can ask for an immediate restart by
+#   touching a fixed trigger file — e.g. when it has finished a unit of work,
+#   noticed new input, or a config changed:
+#
+#       touch do_work.sh.trigger        # or: : >> do_work.sh.trigger
+#
+#   The runner detects the change and recycles the loop body right away
+#   instead of waiting out the timer.
 # -------------------------------------------------------------------
 
 set -uo pipefail   # no -e: a transient tmux hiccup shouldn't abort the loop
 
 # ---- Args ----------------------------------------------------------
 if [[ $# -lt 1 || "$1" == "-h" || "$1" == "--help" ]]; then
-    echo "Usage: cheeky-loop-runner <script.sh> [run_minutes]"
+    cat <<'USAGE'
+Usage: cheeky-loop-runner <script.sh> [run_minutes]
+
+  run_minutes   Max length of each burst, in minutes (default 30).
+                Use 0 for pure event-driven mode (no time ceiling).
+
+Environment overrides (all optional):
+  CLR_TRIGGER_FILE    Path to the trigger file the loop body touches to
+                      request an immediate restart.
+                      Default: <script-name>.trigger in the sandbox.
+  CLR_WAIT_SECONDS    Grace/debounce wait before each restart, so rapid
+                      triggers coalesce and final writes settle (default 2).
+  CLR_POLL_SECONDS    Stopfile + fallback-watch poll interval (default 10).
+  CLR_SETTLE_SECONDS  Pause after the Ctrl-Cs before restarting (default 2).
+  CLR_WATCH_BACKEND   auto | inotify | poll (default auto). 'inotify' needs
+                      inotify-tools (apt install inotify-tools); 'poll'
+                      needs nothing beyond coreutils.
+USAGE
     exit 1
 fi
 
@@ -44,13 +76,35 @@ BASE="$(basename "$TARGET")"
 SAFE="${BASE//[^A-Za-z0-9_]/_}"                 # tmux-safe version of the name
 SESSION="looprunner-${SAFE}"                    # tmux session name
 STOPFILE="${SANDBOX}/${BASE}.stop"              # create this file to stop the loop
-RUN_SECONDS=$(( RUN_MINUTES * 60 ))
-SETTLE_SECONDS=2                                # pause after Ctrl-C so it exits
-POLL_SECONDS=10                                 # stopfile check interval
+TRIGGER_FILE="${CLR_TRIGGER_FILE:-${SANDBOX}/${BASE}.trigger}"  # touch to restart
+RUN_SECONDS=$(( RUN_MINUTES * 60 ))             # 0 => no time ceiling
+SETTLE_SECONDS="${CLR_SETTLE_SECONDS:-2}"       # pause after Ctrl-C so it exits
+POLL_SECONDS="${CLR_POLL_SECONDS:-10}"          # stopfile / poll-watch interval
+WAIT_SECONDS="${CLR_WAIT_SECONDS:-2}"           # grace/debounce before a restart
+WATCH_BACKEND="${CLR_WATCH_BACKEND:-auto}"      # auto | inotify | poll
 CMD="bash $(printf '%q' "$SCRIPT_ABS")"         # the command run inside tmux
 # --------------------------------------------------------------------
 
 command -v tmux >/dev/null 2>&1 || { echo "Error: tmux is not installed." >&2; exit 1; }
+
+# Pick a watch backend. 'inotify' is the neat Linux-native, no-polling path;
+# 'poll' is a dependency-free fallback that works anywhere coreutils does.
+if [[ "$WATCH_BACKEND" == "auto" ]]; then
+    if command -v inotifywait >/dev/null 2>&1; then
+        WATCH_BACKEND="inotify"
+    else
+        WATCH_BACKEND="poll"
+    fi
+elif [[ "$WATCH_BACKEND" == "inotify" ]] && ! command -v inotifywait >/dev/null 2>&1; then
+    echo "Warning: CLR_WATCH_BACKEND=inotify but inotifywait not found; using poll." >&2
+    WATCH_BACKEND="poll"
+fi
+
+TRIGGER_DIR="$(dirname "$TRIGGER_FILE")"
+TRIGGER_NAME="$(basename "$TRIGGER_FILE")"
+
+# Full mtime (incl. nanoseconds) or the literal 'absent' if the file is gone.
+trigger_mtime() { stat -c %y "$TRIGGER_FILE" 2>/dev/null || echo absent; }
 
 # Start fresh: drop any leftover session with this name, then create a new
 # one rooted in the sandbox directory.
@@ -74,11 +128,71 @@ cleanup() {
 # Ctrl-C / kill on THIS process cleans up the tmux session too.
 trap cleanup INT TERM
 
+# Block until it's time to recycle the loop body. Echoes one of:
+#   trigger  — the trigger file was touched/modified
+#   timer    — the run period elapsed
+#   stop     — the stopfile appeared (caller handles the clean shutdown)
+# Runs inside a $(...) subshell, so it must NOT exit the process itself.
+wait_inotify() {
+    local start now elapsed remaining ev rc
+    start=$(date +%s)
+    while true; do
+        [[ -e "$STOPFILE" ]] && { echo stop; return; }
+
+        if (( RUN_SECONDS > 0 )); then
+            now=$(date +%s); elapsed=$(( now - start ))
+            (( elapsed >= RUN_SECONDS )) && { echo timer; return; }
+            remaining=$(( RUN_SECONDS - elapsed ))
+            (( remaining > POLL_SECONDS )) && remaining=$POLL_SECONDS
+        else
+            remaining=$POLL_SECONDS
+        fi
+
+        ev=$(inotifywait -q -t "$remaining" \
+                -e close_write -e create -e moved_to -e attrib -e modify \
+                --format '%f' "$TRIGGER_DIR" 2>/dev/null)
+        rc=$?
+        if (( rc == 0 )); then
+            [[ "$ev" == "$TRIGGER_NAME" ]] && { echo trigger; return; }
+            continue                      # some other file changed; keep waiting
+        elif (( rc == 2 )); then
+            continue                      # timeout: loop to re-check stop/timer
+        else
+            sleep "$POLL_SECONDS"         # inotifywait error; degrade gracefully
+        fi
+    done
+}
+
+wait_poll() {
+    local start now elapsed baseline current
+    start=$(date +%s)
+    baseline="$(trigger_mtime)"           # snapshot taken as the run begins
+    while true; do
+        [[ -e "$STOPFILE" ]] && { echo stop; return; }
+        current="$(trigger_mtime)"
+        [[ "$current" != "$baseline" ]] && { echo trigger; return; }
+        if (( RUN_SECONDS > 0 )); then
+            now=$(date +%s); elapsed=$(( now - start ))
+            (( elapsed >= RUN_SECONDS )) && { echo timer; return; }
+        fi
+        sleep "$POLL_SECONDS"
+    done
+}
+
+wait_for_event() {
+    if [[ "$WATCH_BACKEND" == "inotify" ]]; then wait_inotify; else wait_poll; fi
+}
+
+period_desc="${RUN_MINUTES} min"
+(( RUN_SECONDS == 0 )) && period_desc="event-driven only (no time limit)"
+
 echo "cheeky-loop-runner started."
 echo "  script : $SCRIPT_ABS"
 echo "  cwd    : $SANDBOX"
 echo "  session: $SESSION   (attach: tmux attach -t $SESSION)"
-echo "  period : ${RUN_MINUTES} min"
+echo "  period : $period_desc"
+echo "  trigger: touch '$TRIGGER_FILE'   (watch: $WATCH_BACKEND)"
+echo "  wait   : ${WAIT_SECONDS}s grace before each restart"
 echo "  stop   : touch '$STOPFILE'   (or Ctrl-C here)"
 
 cycle=1
@@ -91,20 +205,26 @@ while true; do
     echo "[$(date '+%F %T')] Cycle $cycle: starting -> $CMD"
     tmux send-keys -t "$SESSION" "$CMD" Enter
 
-    # Wait the run period, checking the stopfile periodically.
-    waited=0
-    while (( waited < RUN_SECONDS )); do
-        if [[ -e "$STOPFILE" ]]; then
+    reason="$(wait_for_event)"
+    case "$reason" in
+        stop)
             echo "Stopfile found mid-run — exiting."
             cleanup
-        fi
-        sleep "$POLL_SECONDS"
-        waited=$(( waited + POLL_SECONDS ))
-    done
+            ;;
+        trigger)
+            echo "[$(date '+%F %T')] Cycle $cycle: trigger fired ($TRIGGER_FILE) — restarting in ${WAIT_SECONDS}s."
+            ;;
+        timer)
+            echo "[$(date '+%F %T')] Cycle $cycle: ${RUN_MINUTES}-min period elapsed — restarting in ${WAIT_SECONDS}s."
+            ;;
+    esac
+
+    # Configurable grace/debounce: lets a burst of triggers coalesce into one
+    # restart and gives the program a moment to flush before we interrupt it.
+    sleep "$WAIT_SECONDS"
 
     echo "[$(date '+%F %T')] Cycle $cycle: sending 4x Ctrl-C."
     send_ctrl_c
     sleep "$SETTLE_SECONDS"
     cycle=$(( cycle + 1 ))
 done
-

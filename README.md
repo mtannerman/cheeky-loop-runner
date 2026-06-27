@@ -1,24 +1,27 @@
 # cheeky-loop-runner
 
-A tiny Bash utility that runs a shell script inside a [tmux](https://github.com/tmux/tmux) session on a timed loop: it starts your script, lets it run for a fixed period (30 minutes by default), kills it by sending four `Ctrl-C`s to the session, then restarts it — forever, until you stop it.
+A tiny Bash utility that runs a shell script inside a [tmux](https://github.com/tmux/tmux) session on a timed **and event-driven** loop: it starts your script, lets it run until either a fixed period elapses (30 minutes by default) **or your script touches a trigger file**, kills it by sending four `Ctrl-C`s to the session, then restarts it — forever, until you stop it.
 
-It's handy for jobs that you want to run in fixed-length bursts and restart cleanly: long-running scrapers, training or fuzzing runs, watchers, anything that should be cycled rather than left running indefinitely.
+It's handy for jobs that you want to run in fixed-length bursts and restart cleanly: long-running scrapers, training or fuzzing runs, watchers, anything that should be cycled rather than left running indefinitely. With the trigger file, the job itself can also say "recycle me now" without waiting out the timer.
 
 ## Features
 
 - **Run anything** — point it at any shell script; no execute bit or shebang required.
+- **Event-driven restarts** — your script touches a fixed trigger file and the runner recycles it immediately, no waiting for the timer.
+- **Linux-native watching** — uses `inotifywait` when available (no polling), and falls back to a dependency-free mtime poll otherwise.
 - **Sandbox-friendly** — the script runs in the directory you invoked `cheeky-loop-runner` from, so relative paths inside your script resolve where you expect.
 - **Clean restarts** — each cycle sends four `Ctrl-C`s, then restarts from a fresh prompt.
 - **Two ways to stop** — `Ctrl-C` the runner, or drop a stopfile (no need to find a PID).
 - **Predictable sessions** — the tmux session is named after your script, so you can attach and watch it live.
-- **Configurable period** — default 30-minute cycles, overridable per run.
+- **Configurable period & wait** — default 30-minute cycles (or `0` for pure event-driven), plus a configurable grace/debounce wait before each restart.
 
 ## Requirements
 
 - Bash 4+
 - `tmux`
+- `inotify-tools` *(optional, Linux)* — for instant, no-polling trigger detection. Without it the runner falls back to mtime polling.
 
-On Debian/Ubuntu: `sudo apt install tmux`. On macOS: `brew install tmux`.
+On Debian/Ubuntu: `sudo apt install tmux inotify-tools`. On macOS: `brew install tmux` (no `inotifywait`; the poll fallback is used).
 
 ## Installation
 
@@ -51,7 +54,27 @@ Run with 45-minute cycles instead of the 30-minute default:
 cheeky-loop-runner do_work.sh 45
 ```
 
-On startup it prints the resolved script path, the working directory, the tmux session name, the cycle length, and the exact stopfile path to use.
+Run in **pure event-driven mode** (no time ceiling — only the trigger file or stopfile recycle/stop it):
+
+```bash
+cheeky-loop-runner do_work.sh 0
+```
+
+On startup it prints the resolved script path, the working directory, the tmux session name, the cycle length, the trigger and stopfile paths, and the watch backend in use.
+
+### Triggering a restart from your script (event-driven)
+
+The runner watches a fixed **trigger file** — by default `<script-name>.trigger` in the sandbox (e.g. `do_work.sh.trigger`). Whenever that file is created, touched, or written, the runner recycles the loop body right away rather than waiting out the timer.
+
+So from inside your loop body (or any other process), just touch it when you want a restart — for example after finishing a unit of work, noticing new input, or detecting a config change:
+
+```bash
+touch do_work.sh.trigger      # or: : >> do_work.sh.trigger
+```
+
+The runner waits a short, configurable grace period (`CLR_WAIT_SECONDS`, default 2s) so a burst of touches coalesces into a single restart and any final writes settle, then sends the `Ctrl-C`s and restarts. Only changes that happen *after* a run begins count, so a stale trigger file left over from a previous run won't cause a spurious restart.
+
+Under the hood this uses `inotifywait` when it's installed (instant, no polling) and otherwise falls back to checking the trigger file's modification time every `CLR_POLL_SECONDS`. Force one or the other with `CLR_WATCH_BACKEND=inotify|poll`.
 
 ### Watching it run
 
@@ -83,23 +106,37 @@ Each cycle, `cheeky-loop-runner`:
 
 1. Checks for the stopfile and exits if it's present.
 2. Sends `bash /abs/path/to/your_script.sh` into the tmux session and presses Enter.
-3. Waits the configured period, polling for the stopfile every 10 seconds.
-4. Sends four `Ctrl-C`s to the session (with a short gap between each) to terminate the program.
-5. Pauses briefly so the program fully exits, then loops.
+3. Waits until **any** of: the trigger file changes, the run period elapses, or the stopfile appears — whichever comes first. (The trigger is watched via `inotifywait`, or an mtime poll as a fallback; the stopfile is re-checked on every wake.)
+4. Waits a short configurable grace period (`CLR_WAIT_SECONDS`) so triggers coalesce and writes settle.
+5. Sends four `Ctrl-C`s to the session (with a short gap between each) to terminate the program.
+6. Pauses briefly so the program fully exits, then loops.
 
 The session is created detached and rooted in your current directory (`tmux new-session -d -c "$PWD"`), and the script path is resolved to an absolute path up front, so changing the session's working directory never breaks the reference. Any leftover session with the same name is removed before a new run starts, so every run begins from a clean state.
 
 ## Configuration
 
-Most knobs are exposed as the optional `run_minutes` argument and the stopfile convention. A few additional defaults live in the configuration block near the top of the script and can be edited directly:
+The cycle length is the optional `run_minutes` argument (`0` = pure event-driven). Everything else is configurable via environment variables, so you don't have to edit the script:
 
-- `SETTLE_SECONDS` — pause after the `Ctrl-C`s before restarting (default `2`).
-- `POLL_SECONDS` — how often the stopfile is checked while waiting (default `10`).
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CLR_TRIGGER_FILE` | `<script>.trigger` in the sandbox | The fixed file your loop body touches to request an immediate restart. |
+| `CLR_WAIT_SECONDS` | `2` | Grace/debounce wait before each restart, so rapid triggers coalesce and final writes settle. |
+| `CLR_POLL_SECONDS` | `10` | Stopfile + fallback-watch poll interval. |
+| `CLR_SETTLE_SECONDS` | `2` | Pause after the `Ctrl-C`s before restarting. |
+| `CLR_WATCH_BACKEND` | `auto` | `auto`, `inotify`, or `poll`. `auto` uses `inotifywait` if present, else `poll`. |
+
+Example — event-driven only, with a custom trigger file and a 5-second debounce:
+
+```bash
+CLR_TRIGGER_FILE=/tmp/recycle.flag CLR_WAIT_SECONDS=5 cheeky-loop-runner do_work.sh 0
+```
 
 ## Notes and caveats
 
 - The four `Ctrl-C`s are sent as terminal interrupts to whatever is running in the session. A program that ignores `SIGINT` won't be stopped by them — adjust the script if you need a different signal.
-- If your script finishes on its own before the period elapses, the session simply sits at an idle shell prompt until the cycle ends; the `Ctrl-C`s then land harmlessly on that prompt.
+- The trigger file is matched by name in its directory. If you point `CLR_TRIGGER_FILE` at a path whose directory doesn't exist yet, create the directory first (the runner watches the directory, not a not-yet-existent file).
+- With the `poll` backend, trigger detection happens within `CLR_POLL_SECONDS`; with `inotify` it's effectively instant. Either way, only modifications that occur after a run starts are counted.
+- If your script finishes on its own before the period elapses, the session simply sits at an idle shell prompt until the cycle ends (or a trigger fires); the `Ctrl-C`s then land harmlessly on that prompt.
 - Running the same script name from two different sandboxes produces the same session name. If you need concurrent runs of identically named scripts, give them distinct names or adjust the `SESSION` variable.
 
 ## Contributing
