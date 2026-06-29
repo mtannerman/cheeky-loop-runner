@@ -8,6 +8,7 @@ It's handy for jobs that you want to run in fixed-length bursts and restart clea
 
 - **Run anything** — point it at any shell script; no execute bit or shebang required.
 - **Event-driven restarts** — your script touches a fixed trigger file and the runner recycles it immediately, no waiting for the timer.
+- **"I'm done" signalling** — when the body finishes on its own it can touch a `process_ended` file; the runner restarts the next cycle right away without bothering to send `Ctrl-C`.
 - **Linux-native watching** — uses `inotifywait` when available (no polling), and falls back to a dependency-free mtime poll otherwise.
 - **Sandbox-friendly** — the script runs in the directory you invoked `cheeky-loop-runner` from, so relative paths inside your script resolve where you expect.
 - **Clean restarts** — each cycle sends four `Ctrl-C`s, then restarts from a fresh prompt.
@@ -76,6 +77,20 @@ The runner waits a short, configurable grace period (`CLR_WAIT_SECONDS`, default
 
 Under the hood this uses `inotifywait` when it's installed (instant, no polling) and otherwise falls back to checking the trigger file's modification time every `CLR_POLL_SECONDS`. Force one or the other with `CLR_WATCH_BACKEND=inotify|poll`.
 
+### Signalling that the process is done (event-driven)
+
+The trigger file means "I'm still running — kill me and start over." When instead your loop body **finishes its work and exits on its own**, it can say so by touching the **process_ended file** — by default `<script-name>.process_ended` in the sandbox (e.g. `do_work.sh.process_ended`):
+
+```bash
+touch do_work.sh.process_ended   # last thing the body does before exiting
+```
+
+The runner notices, skips the four `Ctrl-C`s entirely (there's nothing left to interrupt), waits `CLR_SETTLE_SECONDS` so the body fully exits and the tmux pane returns to a shell prompt, then launches the next cycle immediately — no grace/debounce wait, no timer wait.
+
+The signal is consumed each cycle: the runner removes the `process_ended` file before launching the body and again after acting on it, so a stale file left over from a previous run won't cause a spurious restart. It's watched by the same backend as the trigger (`inotifywait` when available, otherwise an existence check every `CLR_POLL_SECONDS`).
+
+> **Note:** touch `process_ended` as the *last* thing the body does. If the script is still running when the runner relaunches, the new command would be typed into the still-running process rather than the shell.
+
 ### Watching it run
 
 The session is named `looprunner-<your_script_name>`. Attach to watch live output:
@@ -104,12 +119,13 @@ Either of these works:
 
 Each cycle, `cheeky-loop-runner`:
 
-1. Checks for the stopfile and exits if it's present.
+1. Checks for the stopfile and exits if it's present, then clears any stale `process_ended` file.
 2. Sends `bash /abs/path/to/your_script.sh` into the tmux session and presses Enter.
-3. Waits until **any** of: the trigger file changes, the run period elapses, or the stopfile appears — whichever comes first. (The trigger is watched via `inotifywait`, or an mtime poll as a fallback; the stopfile is re-checked on every wake.)
-4. Waits a short configurable grace period (`CLR_WAIT_SECONDS`) so triggers coalesce and writes settle.
+3. Waits until **any** of: the `process_ended` file appears, the trigger file changes, the run period elapses, or the stopfile appears — whichever comes first. (These are watched via `inotifywait`, or an mtime/existence poll as a fallback; the stopfile is re-checked on every wake.)
+4. If `process_ended` fired, it skips straight to step 7 — no grace wait, no `Ctrl-C`. Otherwise (trigger or timer) it waits a short configurable grace period (`CLR_WAIT_SECONDS`) so triggers coalesce and writes settle.
 5. Sends four `Ctrl-C`s to the session (with a short gap between each) to terminate the program.
-6. Pauses briefly so the program fully exits, then loops.
+6. Pauses briefly so the program fully exits.
+7. Loops into the next cycle.
 
 The session is created detached and rooted in your current directory (`tmux new-session -d -c "$PWD"`), and the script path is resolved to an absolute path up front, so changing the session's working directory never breaks the reference. Any leftover session with the same name is removed before a new run starts, so every run begins from a clean state.
 
@@ -119,7 +135,8 @@ The cycle length is the optional `run_minutes` argument (`0` = pure event-driven
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `CLR_TRIGGER_FILE` | `<script>.trigger` in the sandbox | The fixed file your loop body touches to request an immediate restart. |
+| `CLR_TRIGGER_FILE` | `<script>.trigger` in the sandbox | The fixed file your loop body touches to request an immediate (kill-and-restart) recycle. |
+| `CLR_PROCESS_ENDED_FILE` | `<script>.process_ended` in the sandbox | The fixed file your loop body touches to signal it finished on its own; the runner restarts without sending `Ctrl-C`. |
 | `CLR_WAIT_SECONDS` | `2` | Grace/debounce wait before each restart, so rapid triggers coalesce and final writes settle. |
 | `CLR_POLL_SECONDS` | `10` | Stopfile + fallback-watch poll interval. |
 | `CLR_SETTLE_SECONDS` | `2` | Pause after the `Ctrl-C`s before restarting. |
@@ -136,7 +153,7 @@ CLR_TRIGGER_FILE=/tmp/recycle.flag CLR_WAIT_SECONDS=5 cheeky-loop-runner do_work
 - The four `Ctrl-C`s are sent as terminal interrupts to whatever is running in the session. A program that ignores `SIGINT` won't be stopped by them — adjust the script if you need a different signal.
 - The trigger file is matched by name in its directory. If you point `CLR_TRIGGER_FILE` at a path whose directory doesn't exist yet, create the directory first (the runner watches the directory, not a not-yet-existent file).
 - With the `poll` backend, trigger detection happens within `CLR_POLL_SECONDS`; with `inotify` it's effectively instant. Either way, only modifications that occur after a run starts are counted.
-- If your script finishes on its own before the period elapses, the session simply sits at an idle shell prompt until the cycle ends (or a trigger fires); the `Ctrl-C`s then land harmlessly on that prompt.
+- If your script finishes on its own before the period elapses and *doesn't* touch the `process_ended` file, the session simply sits at an idle shell prompt until the cycle ends (or a trigger fires); the `Ctrl-C`s then land harmlessly on that prompt. Touch `process_ended` to skip that wait and recycle immediately.
 - Running the same script name from two different sandboxes produces the same session name. If you need concurrent runs of identically named scripts, give them distinct names or adjust the `SESSION` variable.
 
 ## Contributing

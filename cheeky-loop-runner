@@ -12,12 +12,15 @@
 #
 # It runs <script.sh> inside a detached tmux session (rooted in the
 # directory you invoked it from). Each cycle ends as soon as ANY of:
+#   * the process_ended file is touched, signalling the body finished on
+#     its own (event-driven; restart WITHOUT forcibly Ctrl-C-ing it),
 #   * the trigger file is touched/modified by your script (event-driven),
 #   * the run period elapses (run_minutes, default 30; 0 = no time limit),
 #   * the stopfile appears (clean shutdown).
 # On trigger/timer it sends 4x Ctrl-C to kill the program, waits a short
-# configurable grace period, then restarts. Loops forever until you Ctrl-C
-# this process or create the stopfile.
+# configurable grace period, then restarts. On process_ended it just
+# restarts (the body already exited). Loops forever until you Ctrl-C this
+# process or create the stopfile.
 #
 # EVENT-DRIVEN RESTARTS
 #   Your loop body (the "inner" script) can ask for an immediate restart by
@@ -28,6 +31,16 @@
 #
 #   The runner detects the change and recycles the loop body right away
 #   instead of waiting out the timer.
+#
+# SIGNALLING "I'M DONE" (process_ended)
+#   If the inner script finishes its work on its own, it can touch the
+#   process_ended file instead of (or just before) exiting:
+#
+#       touch do_work.sh.process_ended
+#
+#   The runner notices, skips the 4x Ctrl-C kill (there's nothing left to
+#   interrupt), and starts the next cycle. Use this when the body exits
+#   naturally and you simply want it cycled again straight away.
 # -------------------------------------------------------------------
 
 set -uo pipefail   # no -e: a transient tmux hiccup shouldn't abort the loop
@@ -44,6 +57,11 @@ Environment overrides (all optional):
   CLR_TRIGGER_FILE    Path to the trigger file the loop body touches to
                       request an immediate restart.
                       Default: <script-name>.trigger in the sandbox.
+  CLR_PROCESS_ENDED_FILE
+                      Path to the file the loop body touches to signal it
+                      has finished on its own; the runner restarts without
+                      sending Ctrl-C.
+                      Default: <script-name>.process_ended in the sandbox.
   CLR_WAIT_SECONDS    Grace/debounce wait before each restart, so rapid
                       triggers coalesce and final writes settle (default 2).
   CLR_POLL_SECONDS    Stopfile + fallback-watch poll interval (default 10).
@@ -77,6 +95,7 @@ SAFE="${BASE//[^A-Za-z0-9_]/_}"                 # tmux-safe version of the name
 SESSION="looprunner-${SAFE}"                    # tmux session name
 STOPFILE="${SANDBOX}/${BASE}.stop"              # create this file to stop the loop
 TRIGGER_FILE="${CLR_TRIGGER_FILE:-${SANDBOX}/${BASE}.trigger}"  # touch to restart
+PROCESS_ENDED_FILE="${CLR_PROCESS_ENDED_FILE:-${SANDBOX}/${BASE}.process_ended}"  # touch when the body finished on its own
 RUN_SECONDS=$(( RUN_MINUTES * 60 ))             # 0 => no time ceiling
 SETTLE_SECONDS="${CLR_SETTLE_SECONDS:-2}"       # pause after Ctrl-C so it exits
 POLL_SECONDS="${CLR_POLL_SECONDS:-10}"          # stopfile / poll-watch interval
@@ -102,6 +121,13 @@ fi
 
 TRIGGER_DIR="$(dirname "$TRIGGER_FILE")"
 TRIGGER_NAME="$(basename "$TRIGGER_FILE")"
+ENDED_DIR="$(dirname "$PROCESS_ENDED_FILE")"
+ENDED_NAME="$(basename "$PROCESS_ENDED_FILE")"
+
+# Directories the inotify backend must watch: the trigger file's dir, plus
+# the process_ended file's dir if it's a different one.
+WATCH_PATHS=("${TRIGGER_DIR}/")
+[[ "$ENDED_DIR" != "$TRIGGER_DIR" ]] && WATCH_PATHS+=("${ENDED_DIR}/")
 
 # Full mtime (incl. nanoseconds) or the literal 'absent' if the file is gone.
 trigger_mtime() { stat -c %y "$TRIGGER_FILE" 2>/dev/null || echo absent; }
@@ -129,6 +155,7 @@ cleanup() {
 trap cleanup INT TERM
 
 # Block until it's time to recycle the loop body. Echoes one of:
+#   done     — the process_ended file appeared (body finished on its own)
 #   trigger  — the trigger file was touched/modified
 #   timer    — the run period elapsed
 #   stop     — the stopfile appeared (caller handles the clean shutdown)
@@ -138,6 +165,8 @@ wait_inotify() {
     start=$(date +%s)
     while true; do
         [[ -e "$STOPFILE" ]] && { echo stop; return; }
+        # Catch a process_ended touch that landed before inotifywait re-armed.
+        [[ -e "$PROCESS_ENDED_FILE" ]] && { echo done; return; }
 
         if (( RUN_SECONDS > 0 )); then
             now=$(date +%s); elapsed=$(( now - start ))
@@ -148,13 +177,18 @@ wait_inotify() {
             remaining=$POLL_SECONDS
         fi
 
+        # Report the full path (%w%f) so we can tell the trigger and the
+        # process_ended file apart even when they live in different dirs.
         ev=$(inotifywait -q -t "$remaining" \
                 -e close_write -e create -e moved_to -e attrib -e modify \
-                --format '%f' "$TRIGGER_DIR" 2>/dev/null)
+                --format '%w%f' "${WATCH_PATHS[@]}" 2>/dev/null)
         rc=$?
         if (( rc == 0 )); then
-            [[ "$ev" == "$TRIGGER_NAME" ]] && { echo trigger; return; }
-            continue                      # some other file changed; keep waiting
+            case "$ev" in
+                "${ENDED_DIR}/${ENDED_NAME}")     echo done;    return;;
+                "${TRIGGER_DIR}/${TRIGGER_NAME}") echo trigger; return;;
+                *) continue;;                 # some other file changed; keep waiting
+            esac
         elif (( rc == 2 )); then
             continue                      # timeout: loop to re-check stop/timer
         else
@@ -169,6 +203,7 @@ wait_poll() {
     baseline="$(trigger_mtime)"           # snapshot taken as the run begins
     while true; do
         [[ -e "$STOPFILE" ]] && { echo stop; return; }
+        [[ -e "$PROCESS_ENDED_FILE" ]] && { echo done; return; }
         current="$(trigger_mtime)"
         [[ "$current" != "$baseline" ]] && { echo trigger; return; }
         if (( RUN_SECONDS > 0 )); then
@@ -192,6 +227,7 @@ echo "  cwd    : $SANDBOX"
 echo "  session: $SESSION   (attach: tmux attach -t $SESSION)"
 echo "  period : $period_desc"
 echo "  trigger: touch '$TRIGGER_FILE'   (watch: $WATCH_BACKEND)"
+echo "  done   : touch '$PROCESS_ENDED_FILE'   (restart, no Ctrl-C)"
 echo "  wait   : ${WAIT_SECONDS}s grace before each restart"
 echo "  stop   : touch '$STOPFILE'   (or Ctrl-C here)"
 
@@ -202,6 +238,10 @@ while true; do
         cleanup
     fi
 
+    # Clear any stale process_ended signal (e.g. from a previous, unclean run)
+    # so the body has to touch it afresh to count as "done" this cycle.
+    rm -f "$PROCESS_ENDED_FILE" 2>/dev/null
+
     echo "[$(date '+%F %T')] Cycle $cycle: starting -> $CMD"
     tmux send-keys -t "$SESSION" "$CMD" Enter
 
@@ -210,6 +250,16 @@ while true; do
         stop)
             echo "Stopfile found mid-run — exiting."
             cleanup
+            ;;
+        done)
+            # The body finished on its own and said so. Nothing to kill; give
+            # it a beat to fully exit (so the pane is back at a shell prompt
+            # before we relaunch), then loop straight into the next cycle.
+            echo "[$(date '+%F %T')] Cycle $cycle: process signalled done ($PROCESS_ENDED_FILE) — restarting (no Ctrl-C)."
+            rm -f "$PROCESS_ENDED_FILE" 2>/dev/null
+            sleep "$SETTLE_SECONDS"
+            cycle=$(( cycle + 1 ))
+            continue
             ;;
         trigger)
             echo "[$(date '+%F %T')] Cycle $cycle: trigger fired ($TRIGGER_FILE) — restarting in ${WAIT_SECONDS}s."
