@@ -38,9 +38,10 @@
 #
 #       touch do_work.sh.process_ended
 #
-#   The runner notices, skips the 4x Ctrl-C kill (there's nothing left to
-#   interrupt), and starts the next cycle. Use this when the body exits
-#   naturally and you simply want it cycled again straight away.
+#   The runner notices, skips the 4x Ctrl-C kill (there's nothing to forcibly
+#   interrupt), gives the body up to CLR_CLEANUP_SECONDS (default 4 min) to
+#   finish cleaning up and exit, then starts the next cycle. Use this when the
+#   body wraps up on its own and you want it cycled again afterwards.
 # -------------------------------------------------------------------
 
 set -uo pipefail   # no -e: a transient tmux hiccup shouldn't abort the loop
@@ -62,8 +63,12 @@ Environment overrides (all optional):
                       has finished on its own; the runner restarts without
                       sending Ctrl-C.
                       Default: <script-name>.process_ended in the sandbox.
-  CLR_WAIT_SECONDS    Grace/debounce wait before each restart, so rapid
-                      triggers coalesce and final writes settle (default 2).
+  CLR_WAIT_SECONDS    Grace/debounce wait before each trigger/timer restart,
+                      so rapid triggers coalesce and final writes settle
+                      (default 240, i.e. 4 min).
+  CLR_CLEANUP_SECONDS Time the loop body is given to finish cleaning up after
+                      it touches the process_ended file, before the runner
+                      starts the next cycle (default 240, i.e. 4 min).
   CLR_POLL_SECONDS    Stopfile + fallback-watch poll interval (default 10).
   CLR_SETTLE_SECONDS  Pause after the Ctrl-Cs before restarting (default 2).
   CLR_WATCH_BACKEND   auto | inotify | poll (default auto). 'inotify' needs
@@ -99,7 +104,8 @@ PROCESS_ENDED_FILE="${CLR_PROCESS_ENDED_FILE:-${SANDBOX}/${BASE}.process_ended}"
 RUN_SECONDS=$(( RUN_MINUTES * 60 ))             # 0 => no time ceiling
 SETTLE_SECONDS="${CLR_SETTLE_SECONDS:-2}"       # pause after Ctrl-C so it exits
 POLL_SECONDS="${CLR_POLL_SECONDS:-10}"          # stopfile / poll-watch interval
-WAIT_SECONDS="${CLR_WAIT_SECONDS:-2}"           # grace/debounce before a restart
+WAIT_SECONDS="${CLR_WAIT_SECONDS:-240}"         # grace/debounce before a restart (4 min)
+CLEANUP_SECONDS="${CLR_CLEANUP_SECONDS:-240}"   # time the body gets to clean up after process_ended (4 min)
 WATCH_BACKEND="${CLR_WATCH_BACKEND:-auto}"      # auto | inotify | poll
 CMD="bash $(printf '%q' "$SCRIPT_ABS")"         # the command run inside tmux
 # --------------------------------------------------------------------
@@ -227,8 +233,8 @@ echo "  cwd    : $SANDBOX"
 echo "  session: $SESSION   (attach: tmux attach -t $SESSION)"
 echo "  period : $period_desc"
 echo "  trigger: touch '$TRIGGER_FILE'   (watch: $WATCH_BACKEND)"
-echo "  done   : touch '$PROCESS_ENDED_FILE'   (restart, no Ctrl-C)"
-echo "  wait   : ${WAIT_SECONDS}s grace before each restart"
+echo "  done   : touch '$PROCESS_ENDED_FILE'   (restart, no Ctrl-C; ${CLEANUP_SECONDS}s cleanup)"
+echo "  wait   : ${WAIT_SECONDS}s grace before each trigger/timer restart"
 echo "  stop   : touch '$STOPFILE'   (or Ctrl-C here)"
 
 cycle=1
@@ -252,12 +258,13 @@ while true; do
             cleanup
             ;;
         done)
-            # The body finished on its own and said so. Nothing to kill; give
-            # it a beat to fully exit (so the pane is back at a shell prompt
-            # before we relaunch), then loop straight into the next cycle.
-            echo "[$(date '+%F %T')] Cycle $cycle: process signalled done ($PROCESS_ENDED_FILE) — restarting (no Ctrl-C)."
+            # The body signalled it's done. Don't kill it; give it up to
+            # CLEANUP_SECONDS to finish any cleanup and exit (so the pane is
+            # back at a shell prompt before we relaunch), then loop straight
+            # into the next cycle.
+            echo "[$(date '+%F %T')] Cycle $cycle: process signalled done ($PROCESS_ENDED_FILE) — allowing ${CLEANUP_SECONDS}s for cleanup, then restarting (no Ctrl-C)."
             rm -f "$PROCESS_ENDED_FILE" 2>/dev/null
-            sleep "$SETTLE_SECONDS"
+            sleep "$CLEANUP_SECONDS"
             cycle=$(( cycle + 1 ))
             continue
             ;;
