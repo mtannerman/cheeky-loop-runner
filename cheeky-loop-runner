@@ -12,15 +12,16 @@
 #
 # It runs <script.sh> inside a detached tmux session (rooted in the
 # directory you invoked it from). Each cycle ends as soon as ANY of:
-#   * the process_ended file is touched, signalling the body finished on
-#     its own (event-driven; restart WITHOUT forcibly Ctrl-C-ing it),
+#   * the process_ended file is touched, requesting a cleanup window before
+#     the body is interrupted (event-driven; wait, Ctrl-C, then restart),
 #   * the trigger file is touched/modified by your script (event-driven),
 #   * the run period elapses (run_minutes, default 30; 0 = no time limit),
 #   * the stopfile appears (clean shutdown).
 # On trigger/timer it sends 4x Ctrl-C to kill the program, waits a short
-# configurable grace period, then restarts. On process_ended it just
-# restarts (the body already exited). Loops forever until you Ctrl-C this
-# process or create the stopfile.
+# configurable grace period, then restarts. On process_ended it uses a
+# separate cleanup grace period before sending the same Ctrl-Cs and
+# restarting. Loops forever until you Ctrl-C this process or create the
+# stopfile.
 #
 # EVENT-DRIVEN RESTARTS
 #   Your loop body (the "inner" script) can ask for an immediate restart by
@@ -33,15 +34,14 @@
 #   instead of waiting out the timer.
 #
 # SIGNALLING "I'M DONE" (process_ended)
-#   If the inner script finishes its work on its own, it can touch the
+#   If the inner script finishes its work, it can touch the
 #   process_ended file instead of (or just before) exiting:
 #
 #       touch do_work.sh.process_ended
 #
-#   The runner notices, skips the 4x Ctrl-C kill (there's nothing to forcibly
-#   interrupt), gives the body up to CLR_CLEANUP_SECONDS (default 4 min) to
-#   finish cleaning up and exit, then starts the next cycle. Use this when the
-#   body wraps up on its own and you want it cycled again afterwards.
+#   The runner notices, gives the body CLR_CLEANUP_SECONDS (default 4 min) to
+#   finish cleaning up, then sends 4x Ctrl-C and starts the next cycle. Use
+#   this when the body needs a cleanup window before being interrupted.
 # -------------------------------------------------------------------
 
 set -uo pipefail   # no -e: a transient tmux hiccup shouldn't abort the loop
@@ -60,15 +60,15 @@ Environment overrides (all optional):
                       Default: <script-name>.trigger in the sandbox.
   CLR_PROCESS_ENDED_FILE
                       Path to the file the loop body touches to signal it
-                      has finished on its own; the runner restarts without
-                      sending Ctrl-C.
+                      has finished its work; after the cleanup wait, the
+                      runner sends Ctrl-C and restarts.
                       Default: <script-name>.process_ended in the sandbox.
   CLR_WAIT_SECONDS    Grace/debounce wait before each trigger/timer restart,
                       so rapid triggers coalesce and final writes settle
                       (default 240, i.e. 4 min).
   CLR_CLEANUP_SECONDS Time the loop body is given to finish cleaning up after
                       it touches the process_ended file, before the runner
-                      starts the next cycle (default 240, i.e. 4 min).
+                      sends Ctrl-C and restarts (default 240, i.e. 4 min).
   CLR_POLL_SECONDS    Stopfile + fallback-watch poll interval (default 10).
   CLR_SETTLE_SECONDS  Pause after the Ctrl-Cs before restarting (default 2).
   CLR_WATCH_BACKEND   auto | inotify | poll (default auto). 'inotify' needs
@@ -100,7 +100,7 @@ SAFE="${BASE//[^A-Za-z0-9_]/_}"                 # tmux-safe version of the name
 SESSION="looprunner-${SAFE}"                    # tmux session name
 STOPFILE="${SANDBOX}/${BASE}.stop"              # create this file to stop the loop
 TRIGGER_FILE="${CLR_TRIGGER_FILE:-${SANDBOX}/${BASE}.trigger}"  # touch to restart
-PROCESS_ENDED_FILE="${CLR_PROCESS_ENDED_FILE:-${SANDBOX}/${BASE}.process_ended}"  # touch when the body finished on its own
+PROCESS_ENDED_FILE="${CLR_PROCESS_ENDED_FILE:-${SANDBOX}/${BASE}.process_ended}"  # touch when the body is ready for cleanup and interruption
 RUN_SECONDS=$(( RUN_MINUTES * 60 ))             # 0 => no time ceiling
 SETTLE_SECONDS="${CLR_SETTLE_SECONDS:-2}"       # pause after Ctrl-C so it exits
 POLL_SECONDS="${CLR_POLL_SECONDS:-10}"          # stopfile / poll-watch interval
@@ -233,7 +233,7 @@ echo "  cwd    : $SANDBOX"
 echo "  session: $SESSION   (attach: tmux attach -t $SESSION)"
 echo "  period : $period_desc"
 echo "  trigger: touch '$TRIGGER_FILE'   (watch: $WATCH_BACKEND)"
-echo "  done   : touch '$PROCESS_ENDED_FILE'   (restart, no Ctrl-C; ${CLEANUP_SECONDS}s cleanup)"
+echo "  done   : touch '$PROCESS_ENDED_FILE'   (${CLEANUP_SECONDS}s cleanup, then Ctrl-C + restart)"
 echo "  wait   : ${WAIT_SECONDS}s grace before each trigger/timer restart"
 echo "  stop   : touch '$STOPFILE'   (or Ctrl-C here)"
 
@@ -252,21 +252,18 @@ while true; do
     tmux send-keys -t "$SESSION" "$CMD" Enter
 
     reason="$(wait_for_event)"
+    restart_delay="$WAIT_SECONDS"
     case "$reason" in
         stop)
             echo "Stopfile found mid-run — exiting."
             cleanup
             ;;
         done)
-            # The body signalled it's done. Don't kill it; give it up to
-            # CLEANUP_SECONDS to finish any cleanup and exit (so the pane is
-            # back at a shell prompt before we relaunch), then loop straight
-            # into the next cycle.
-            echo "[$(date '+%F %T')] Cycle $cycle: process signalled done ($PROCESS_ENDED_FILE) — allowing ${CLEANUP_SECONDS}s for cleanup, then restarting (no Ctrl-C)."
+            # The body signalled it's done. Give it CLEANUP_SECONDS to finish
+            # any cleanup, then interrupt it just like a trigger/timer cycle.
+            echo "[$(date '+%F %T')] Cycle $cycle: process signalled done ($PROCESS_ENDED_FILE) — sending Ctrl-C in ${CLEANUP_SECONDS}s."
             rm -f "$PROCESS_ENDED_FILE" 2>/dev/null
-            sleep "$CLEANUP_SECONDS"
-            cycle=$(( cycle + 1 ))
-            continue
+            restart_delay="$CLEANUP_SECONDS"
             ;;
         trigger)
             echo "[$(date '+%F %T')] Cycle $cycle: trigger fired ($TRIGGER_FILE) — restarting in ${WAIT_SECONDS}s."
@@ -277,8 +274,8 @@ while true; do
     esac
 
     # Configurable grace/debounce: lets a burst of triggers coalesce into one
-    # restart and gives the program a moment to flush before we interrupt it.
-    sleep "$WAIT_SECONDS"
+    # restart and gives the program time to flush before we interrupt it.
+    sleep "$restart_delay"
 
     echo "[$(date '+%F %T')] Cycle $cycle: sending 4x Ctrl-C."
     send_ctrl_c
