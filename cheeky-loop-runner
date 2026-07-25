@@ -13,15 +13,14 @@
 # It runs <script.sh> inside a detached tmux session (rooted in the
 # directory you invoked it from). Each cycle ends as soon as ANY of:
 #   * the process_ended file is touched, requesting a cleanup window before
-#     the body is interrupted (event-driven; wait, Ctrl-C, then restart),
+#     stopping the loop (event-driven; wait, then stop),
 #   * the trigger file is touched/modified by your script (event-driven),
-#   * the run period elapses (run_minutes, default 30; 0 = no time limit),
-#   * the stopfile appears (clean shutdown).
+#   * the run period elapses (run_minutes, default 30; 0 = no time limit).
 # On trigger/timer it sends 4x Ctrl-C to kill the program, waits a short
 # configurable grace period, then restarts. On process_ended it uses a
 # separate cleanup grace period before sending the same Ctrl-Cs and
-# restarting. Loops forever until you Ctrl-C this process or create the
-# stopfile.
+# stopping. Loops forever until you Ctrl-C this process or the
+# process_ended file is touched.
 #
 # EVENT-DRIVEN RESTARTS
 #   Your loop body (the "inner" script) can ask for an immediate restart by
@@ -40,8 +39,8 @@
 #       touch do_work.sh.process_ended
 #
 #   The runner notices, gives the body CLR_CLEANUP_SECONDS (default 4 min) to
-#   finish cleaning up, then sends 4x Ctrl-C and starts the next cycle. Use
-#   this when the body needs a cleanup window before being interrupted.
+#   finish cleaning up, then stops the loop and exits. Use
+#   this when the body needs a cleanup window before stopping.
 # -------------------------------------------------------------------
 
 set -uo pipefail   # no -e: a transient tmux hiccup shouldn't abort the loop
@@ -58,18 +57,18 @@ Environment overrides (all optional):
   CLR_TRIGGER_FILE    Path to the trigger file the loop body touches to
                       request an immediate restart.
                       Default: <script-name>.trigger in the sandbox.
-  CLR_PROCESS_ENDED_FILE
-                      Path to the file the loop body touches to signal it
-                      has finished its work; after the cleanup wait, the
-                      runner sends Ctrl-C and restarts.
-                      Default: <script-name>.process_ended in the sandbox.
-  CLR_WAIT_SECONDS    Grace/debounce wait before each trigger/timer restart,
-                      so rapid triggers coalesce and final writes settle
-                      (default 240, i.e. 4 min).
-  CLR_CLEANUP_SECONDS Time the loop body is given to finish cleaning up after
-                      it touches the process_ended file, before the runner
-                      sends Ctrl-C and restarts (default 240, i.e. 4 min).
-  CLR_POLL_SECONDS    Stopfile + fallback-watch poll interval (default 10).
+#   CLR_PROCESS_ENDED_FILE
+#                       Path to the file the loop body touches to signal it
+#                       has finished its work; after the cleanup wait, the
+#                       runner stops the loop.
+#                       Default: <script-name>.process_ended in the sandbox.
+#   CLR_WAIT_SECONDS    Grace/debounce wait before each trigger/timer restart,
+#                       so rapid triggers coalesce and final writes settle
+#                       (default 240, i.e. 4 min).
+#   CLR_CLEANUP_SECONDS Time the loop body is given to finish cleaning up after
+#                       it touches the process_ended file, before the runner
+#                       sends Ctrl-C and exits (default 240, i.e. 4 min).
+#   CLR_POLL_SECONDS    Poll interval for fallback-watch (default 10).
   CLR_SETTLE_SECONDS  Pause after the Ctrl-Cs before restarting (default 2).
   CLR_WATCH_BACKEND   auto | inotify | poll (default auto). 'inotify' needs
                       inotify-tools (apt install inotify-tools); 'poll'
@@ -98,12 +97,11 @@ SANDBOX="$PWD"                                  # run in the dir you invoked fro
 BASE="$(basename "$TARGET")"
 SAFE="${BASE//[^A-Za-z0-9_]/_}"                 # tmux-safe version of the name
 SESSION="looprunner-${SAFE}"                    # tmux session name
-STOPFILE="${SANDBOX}/${BASE}.stop"              # create this file to stop the loop
 TRIGGER_FILE="${CLR_TRIGGER_FILE:-${SANDBOX}/${BASE}.trigger}"  # touch to restart
-PROCESS_ENDED_FILE="${CLR_PROCESS_ENDED_FILE:-${SANDBOX}/${BASE}.process_ended}"  # touch when the body is ready for cleanup and interruption
+PROCESS_ENDED_FILE="${CLR_PROCESS_ENDED_FILE:-${SANDBOX}/${BASE}.process_ended}"  # touch when the body is ready for cleanup and exit
 RUN_SECONDS=$(( RUN_MINUTES * 60 ))             # 0 => no time ceiling
 SETTLE_SECONDS="${CLR_SETTLE_SECONDS:-2}"       # pause after Ctrl-C so it exits
-POLL_SECONDS="${CLR_POLL_SECONDS:-10}"          # stopfile / poll-watch interval
+POLL_SECONDS="${CLR_POLL_SECONDS:-10}"          # poll-watch interval
 WAIT_SECONDS="${CLR_WAIT_SECONDS:-240}"         # grace/debounce before a restart (4 min)
 CLEANUP_SECONDS="${CLR_CLEANUP_SECONDS:-240}"   # time the body gets to clean up after process_ended (4 min)
 WATCH_BACKEND="${CLR_WATCH_BACKEND:-auto}"      # auto | inotify | poll
@@ -164,13 +162,11 @@ trap cleanup INT TERM
 #   done     — the process_ended file appeared (body finished on its own)
 #   trigger  — the trigger file was touched/modified
 #   timer    — the run period elapsed
-#   stop     — the stopfile appeared (caller handles the clean shutdown)
 # Runs inside a $(...) subshell, so it must NOT exit the process itself.
 wait_inotify() {
     local start now elapsed remaining ev rc
     start=$(date +%s)
     while true; do
-        [[ -e "$STOPFILE" ]] && { echo stop; return; }
         # Catch a process_ended touch that landed before inotifywait re-armed.
         [[ -e "$PROCESS_ENDED_FILE" ]] && { echo done; return; }
 
@@ -196,7 +192,7 @@ wait_inotify() {
                 *) continue;;                 # some other file changed; keep waiting
             esac
         elif (( rc == 2 )); then
-            continue                      # timeout: loop to re-check stop/timer
+            continue                      # timeout: loop to re-check timer
         else
             sleep "$POLL_SECONDS"         # inotifywait error; degrade gracefully
         fi
@@ -208,7 +204,6 @@ wait_poll() {
     start=$(date +%s)
     baseline="$(trigger_mtime)"           # snapshot taken as the run begins
     while true; do
-        [[ -e "$STOPFILE" ]] && { echo stop; return; }
         [[ -e "$PROCESS_ENDED_FILE" ]] && { echo done; return; }
         current="$(trigger_mtime)"
         [[ "$current" != "$baseline" ]] && { echo trigger; return; }
@@ -233,17 +228,11 @@ echo "  cwd    : $SANDBOX"
 echo "  session: $SESSION   (attach: tmux attach -t $SESSION)"
 echo "  period : $period_desc"
 echo "  trigger: touch '$TRIGGER_FILE'   (watch: $WATCH_BACKEND)"
-echo "  done   : touch '$PROCESS_ENDED_FILE'   (${CLEANUP_SECONDS}s cleanup, then Ctrl-C + restart)"
+echo "  done   : touch '$PROCESS_ENDED_FILE'   (${CLEANUP_SECONDS}s cleanup, then exit)"
 echo "  wait   : ${WAIT_SECONDS}s grace before each trigger/timer restart"
-echo "  stop   : touch '$STOPFILE'   (or Ctrl-C here)"
 
 cycle=1
 while true; do
-    if [[ -e "$STOPFILE" ]]; then
-        echo "Stopfile found at $STOPFILE — exiting."
-        cleanup
-    fi
-
     # Clear any stale process_ended signal (e.g. from a previous, unclean run)
     # so the body has to touch it afresh to count as "done" this cycle.
     rm -f "$PROCESS_ENDED_FILE" 2>/dev/null
@@ -254,16 +243,13 @@ while true; do
     reason="$(wait_for_event)"
     restart_delay="$WAIT_SECONDS"
     case "$reason" in
-        stop)
-            echo "Stopfile found mid-run — exiting."
-            cleanup
-            ;;
         done)
             # The body signalled it's done. Give it CLEANUP_SECONDS to finish
-            # any cleanup, then interrupt it just like a trigger/timer cycle.
-            echo "[$(date '+%F %T')] Cycle $cycle: process signalled done ($PROCESS_ENDED_FILE) — sending Ctrl-C in ${CLEANUP_SECONDS}s."
+            # any cleanup, then stop the loop.
+            echo "[$(date '+%F %T')] Cycle $cycle: process signalled done ($PROCESS_ENDED_FILE) — waiting ${CLEANUP_SECONDS}s before stopping."
             rm -f "$PROCESS_ENDED_FILE" 2>/dev/null
-            restart_delay="$CLEANUP_SECONDS"
+            sleep "$CLEANUP_SECONDS"
+            cleanup
             ;;
         trigger)
             echo "[$(date '+%F %T')] Cycle $cycle: trigger fired ($TRIGGER_FILE) — restarting in ${WAIT_SECONDS}s."

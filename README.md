@@ -8,11 +8,11 @@ It's handy for jobs that you want to run in fixed-length bursts and restart clea
 
 - **Run anything** — point it at any shell script; no execute bit or shebang required.
 - **Event-driven restarts** — your script touches a fixed trigger file and the runner recycles it immediately, no waiting for the timer.
-- **"I'm done" signalling** — the body can touch a `process_ended` file to request a cleanup window followed by `Ctrl-C` and a restart.
+- **"I'm done" signalling** — the body can touch a `process_ended` file to request a cleanup window followed by stopping the loop.
 - **Linux-native watching** — uses `inotifywait` when available (no polling), and falls back to a dependency-free mtime poll otherwise.
 - **Sandbox-friendly** — the script runs in the directory you invoked `cheeky-loop-runner` from, so relative paths inside your script resolve where you expect.
 - **Clean restarts** — each cycle sends four `Ctrl-C`s, then restarts from a fresh prompt.
-- **Two ways to stop** — `Ctrl-C` the runner, or drop a stopfile (no need to find a PID).
+- **Two ways to stop** — `Ctrl-C` the runner, or touch the `process_ended` file (no need to find a PID).
 - **Predictable sessions** — the tmux session is named after your script, so you can attach and watch it live.
 - **Configurable period & wait** — default 30-minute cycles (or `0` for pure event-driven), plus a configurable grace/debounce wait before each restart.
 
@@ -55,13 +55,13 @@ Run with 45-minute cycles instead of the 30-minute default:
 cheeky-loop-runner do_work.sh 45
 ```
 
-Run in **pure event-driven mode** (no time ceiling — only the trigger file or stopfile recycle/stop it):
+Run in **pure event-driven mode** (no time ceiling — only the trigger file or process_ended file recycle/stop it):
 
 ```bash
 cheeky-loop-runner do_work.sh 0
 ```
 
-On startup it prints the resolved script path, the working directory, the tmux session name, the cycle length, the trigger and stopfile paths, and the watch backend in use.
+On startup it prints the resolved script path, the working directory, the tmux session name, the cycle length, the trigger and process_ended paths, and the watch backend in use.
 
 ### Triggering a restart from your script (event-driven)
 
@@ -85,13 +85,13 @@ The trigger file means "kill me and start over after the normal debounce." When 
 touch do_work.sh.process_ended   # "I'm wrapping up" — begin cleanup
 ```
 
-The runner notices, waits `CLR_CLEANUP_SECONDS` (default `240`, i.e. 4 minutes) for the body to finish any cleanup, sends four `Ctrl-C`s, pauses for `CLR_SETTLE_SECONDS`, then launches the next cycle.
+The runner notices, waits `CLR_CLEANUP_SECONDS` (default `240`, i.e. 4 minutes) for the body to finish any cleanup, stops the loop, and exits.
 
-The runner always waits the full `CLR_CLEANUP_SECONDS`, so size it to however long the desired cleanup window should be. Touch `process_ended` *before* you start cleaning up (or right as cleanup begins); when the window expires, the runner interrupts whatever is still running in the tmux pane.
+The runner always waits the full `CLR_CLEANUP_SECONDS`, so size it to however long the desired cleanup window should be. Touch `process_ended` *before* you start cleaning up (or right as cleanup begins); when the window expires, the runner tears down the tmux session and exits.
 
-The signal is consumed each cycle: the runner removes the `process_ended` file before launching the body and again after acting on it, so a stale file left over from a previous run won't cause a spurious restart. It's watched by the same backend as the trigger (`inotifywait` when available, otherwise an existence check every `CLR_POLL_SECONDS`).
+The signal is consumed each cycle: the runner removes the `process_ended` file before launching the body. It's watched by the same backend as the trigger (`inotifywait` when available, otherwise an existence check every `CLR_POLL_SECONDS`).
 
-> **Note:** `process_ended` uses `CLR_CLEANUP_SECONDS`, while the ordinary trigger and timer use `CLR_WAIT_SECONDS`. All three paths send the same four `Ctrl-C`s before restarting.
+> **Note:** `process_ended` uses `CLR_CLEANUP_SECONDS`, while the ordinary trigger and timer use `CLR_WAIT_SECONDS`.
 
 ### Watching it run
 
@@ -107,27 +107,27 @@ Detach (leaving everything running) with `Ctrl-b` then `d`.
 
 Either of these works:
 
-- **Stopfile** — from the sandbox, create the stopfile named after your script:
+- **process_ended file** — from the sandbox, touch the process_ended file:
 
   ```bash
-  touch do_work.sh.stop
+  touch do_work.sh.process_ended
   ```
 
-  The loop exits at the next check (within ~10 seconds), kills the running program, and tears down the tmux session. Remember to `rm do_work.sh.stop` before starting again, or the next run will exit immediately.
+  The loop waits for the cleanup window, then kills the running program, tears down the tmux session, and exits.
 
-- **Ctrl-C** — pressing `Ctrl-C` on the `cheeky-loop-runner` process (or `kill`ing it) triggers the same clean shutdown.
+- **Ctrl-C** — pressing `Ctrl-C` on the `cheeky-loop-runner` process (or `kill`ing it) triggers an immediate clean shutdown.
 
 ## How it works
 
 Each cycle, `cheeky-loop-runner`:
 
-1. Checks for the stopfile and exits if it's present, then clears any stale `process_ended` file.
+1. Clears any stale `process_ended` file.
 2. Sends `bash /abs/path/to/your_script.sh` into the tmux session and presses Enter.
-3. Waits until **any** of: the `process_ended` file appears, the trigger file changes, the run period elapses, or the stopfile appears — whichever comes first. (These are watched via `inotifywait`, or an mtime/existence poll as a fallback; the stopfile is re-checked on every wake.)
-4. If `process_ended` fired, it waits `CLR_CLEANUP_SECONDS` (default 4 min) for the body to finish cleaning up. Otherwise (trigger or timer) it waits the configurable grace period (`CLR_WAIT_SECONDS`, default 4 min) so triggers coalesce and writes settle.
-5. Sends four `Ctrl-C`s to the session (with a short gap between each) to terminate the program.
-6. Pauses briefly so the program fully exits.
-7. Loops into the next cycle.
+3. Waits until **any** of: the `process_ended` file appears, the trigger file changes, or the run period elapses — whichever comes first. (These are watched via `inotifywait`, or an mtime/existence poll as a fallback.)
+4. If `process_ended` fired, it waits `CLR_CLEANUP_SECONDS` (default 4 min) for the body to finish cleaning up, then kills the session and exits.
+5. Otherwise (trigger or timer) it waits the configurable grace period (`CLR_WAIT_SECONDS`, default 4 min) so triggers coalesce and writes settle.
+6. Sends four `Ctrl-C`s to the session (with a short gap between each) to terminate the program.
+7. Pauses briefly so the program fully exits, then loops into the next cycle.
 
 The session is created detached and rooted in your current directory (`tmux new-session -d -c "$PWD"`), and the script path is resolved to an absolute path up front, so changing the session's working directory never breaks the reference. Any leftover session with the same name is removed before a new run starts, so every run begins from a clean state.
 
@@ -138,10 +138,10 @@ The cycle length is the optional `run_minutes` argument (`0` = pure event-driven
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CLR_TRIGGER_FILE` | `<script>.trigger` in the sandbox | The fixed file your loop body touches to request an immediate (kill-and-restart) recycle. |
-| `CLR_PROCESS_ENDED_FILE` | `<script>.process_ended` in the sandbox | The fixed file your loop body touches to request a cleanup wait followed by `Ctrl-C` and a restart. |
+| `CLR_PROCESS_ENDED_FILE` | `<script>.process_ended` in the sandbox | The fixed file your loop body touches to request a cleanup wait followed by stopping the loop. |
 | `CLR_WAIT_SECONDS` | `240` (4 min) | Grace/debounce wait before each trigger/timer restart, so rapid triggers coalesce and final writes settle. |
-| `CLR_CLEANUP_SECONDS` | `240` (4 min) | Time the body is given to finish cleaning up after touching the `process_ended` file, before the runner sends `Ctrl-C` and restarts. |
-| `CLR_POLL_SECONDS` | `10` | Stopfile + fallback-watch poll interval. |
+| `CLR_CLEANUP_SECONDS` | `240` (4 min) | Time the body is given to finish cleaning up after touching the `process_ended` file, before the runner exits. |
+| `CLR_POLL_SECONDS` | `10` | Poll interval for fallback-watch. |
 | `CLR_SETTLE_SECONDS` | `2` | Pause after the `Ctrl-C`s before restarting. |
 | `CLR_WATCH_BACKEND` | `auto` | `auto`, `inotify`, or `poll`. `auto` uses `inotifywait` if present, else `poll`. |
 
